@@ -14,6 +14,8 @@
 #include "node.h"
 #include "dir.h"
 #include "statistics.h"
+#include "locks.h"
+#include <errno.h>
 
 #define BLOCKSIZE 4096
 
@@ -26,6 +28,7 @@
 
 struct filesystem {
   struct node *root;
+  struct rwmutex lock;
 };
 
 struct filehandle {
@@ -121,8 +124,11 @@ static int createentry(const char *path, mode_t mode, struct node **node) {
 //
 
 static int memfs_getattr(const char *path, struct stat *stbuf) {
+  rwmutex_read_lock(&the_fs.lock);
+
   struct node *node;
   if(!getnodebypath(path, &the_fs, &node)) {
+    rwmutex_read_unlock(&the_fs.lock);
     return -errno;
   }
 
@@ -140,17 +146,22 @@ static int memfs_getattr(const char *path, struct stat *stbuf) {
   if(S_ISDIR(node->vstat.st_mode)) {
     stbuf->st_nlink++;
   }
-
+  rwmutex_read_unlock(&the_fs.lock);
   return 0;
 }
 
 static int memfs_readlink(const char *path, char *buf, size_t size) {
+  rwmutex_read_lock(&the_fs.lock);
+
   struct node *node;
   if(!getnodebypath(path, &the_fs, &node)) {
-    return -errno;
+    int err = errno;
+    rwmutex_read_unlock(&the_fs.lock);
+    return -err;
   }
 
   if(!S_ISLNK(node->vstat.st_mode)) {
+    rwmutex_read_unlock(&the_fs.lock);
     return -ENOLINK;
   }
 
@@ -164,17 +175,23 @@ static int memfs_readlink(const char *path, char *buf, size_t size) {
   } else {
     strcpy(buf, node->data);
   }
+  rwmutex_read_unlock(&the_fs.lock);
 
   return 0;
 }
 
 static int memfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi) {
+  rwmutex_read_lock(&the_fs.lock);
+
   struct node *dir;
   if(!getnodebypath(path, &the_fs, &dir)) {
-    return -errno;
+    int err=errno;
+    rwmutex_read_unlock(&the_fs.lock);
+    return -err;
   }
 
   if(!S_ISDIR(dir->vstat.st_mode)) {
+    rwmutex_read_unlock(&the_fs.lock);
     return -ENOTDIR;
   }
 
@@ -195,11 +212,12 @@ static int memfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, of
       break;
     entry = entry->next;
   }
+  rwmutex_read_unlock(&the_fs.lock);
 
   return 0;
 }
 
-static int memfs_mknod(const char *path, mode_t mode, dev_t rdev) {
+static int memfs_mknod_locked(const char *path, mode_t mode, dev_t rdev) {
   struct node *node;
   int res = createentry(path, mode, &node);
   if(res) return res;
@@ -214,19 +232,31 @@ static int memfs_mknod(const char *path, mode_t mode, dev_t rdev) {
 
   return 0;
 }
+static int memfs_mknod(const char *path, mode_t mode, dev_t rdev){
+  rwmutex_write_lock(&the_fs.lock);
+  int ret=memfs_mknod_locked(path,mode,rdev);
+  rwmutex_write_unlock(&the_fs.lock);
+  return ret;
+}
 
 static int memfs_mkdir(const char *path, mode_t mode) {
+  rwmutex_write_lock(&the_fs.lock);
   struct node *node;
   int res = createentry(path, S_IFDIR | mode, &node);
-  if(res) return res;
+  if(res){
+    rwmutex_write_unlock(&the_fs.lock);
+    return res;
+  }
 
   // No entries
   node->data = NULL;
 
+  rwmutex_write_unlock(&the_fs.lock);
+
   return 0;
 }
 
-static int memfs_unlink(const char *path) {
+static int memfs_unlink_locked(const char *path) {
   char *dirpath, *name;
   struct node *dir, *node;
 
@@ -273,22 +303,33 @@ static int memfs_unlink(const char *path) {
 
   return 0;
 }
+static int memfs_unlink(const char *path){
+  rwmutex_write_lock(&the_fs.lock);
+  int ret=memfs_unlink_locked(path);
+  rwmutex_write_unlock(&the_fs.lock);
+  return ret;
+}
 
 static int memfs_rmdir(const char *path) {
+  rwmutex_write_lock(&the_fs.lock);
   char *dirpath, *name;
   struct node *dir, *node;
 
   // Find inode
   if(!getnodebypath(path, &the_fs, &node)) {
-    return -errno;
+    int err= errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   if(!S_ISDIR(node->vstat.st_mode)) {
+    rwmutex_write_unlock(&the_fs.lock);
     return -ENOTDIR;
   }
 
   // Check if directory is empty
   if(node->data != NULL) {
+    rwmutex_write_unlock(&the_fs.lock);
     return -ENOTEMPTY;
   }
 
@@ -297,7 +338,9 @@ static int memfs_rmdir(const char *path) {
   // Find parent inode
   if(!getnodebypath(dirpath, &the_fs, &dir)) {
     free(dirpath);
-    return -errno;
+    int err= errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   free(dirpath);
@@ -307,41 +350,54 @@ static int memfs_rmdir(const char *path) {
   // Find directory entry in parent
   if(!dir_remove(dir, name)) {
     free(name);
-    return -errno;
+    int err= errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   free(name);
 
   free(node);
 
+  rwmutex_write_unlock(&the_fs.lock);
   return 0;
 }
 
 static int memfs_symlink(const char *from, const char *to) {
+  rwmutex_write_lock(&the_fs.lock);
   struct node *node;
   int res = createentry(to, S_IFLNK | 0766, &node);
-  if(res) return res;
+  if(res){
+    rwmutex_write_unlock(&the_fs.lock);
+    return res;
+  }
 
   node->data = strdup(from);
   node->vstat.st_size = strlen(from);
 
+  rwmutex_write_unlock(&the_fs.lock);
   return 0;
 }
 
 // TODO: Adapt to description: https://linux.die.net/man/2/rename
 static int memfs_rename(const char *from, const char *to) {
+  rwmutex_write_lock(&the_fs.lock);
   char *fromdir, *fromnam, *todir, *tonam;
   struct node *node, *fromdirnode, *todirnode;
 
   if(!getnodebypath(from, &the_fs, &node)) {
-    return -errno;
+    int err=errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   fromdir = safe_dirname(from);
 
   if(!getnodebypath(fromdir, &the_fs, &fromdirnode)) {
     free(fromdir);
-    return -errno;
+    int err=errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   free(fromdir);
@@ -350,7 +406,9 @@ static int memfs_rename(const char *from, const char *to) {
 
   if(!getnodebypath(todir, &the_fs, &todirnode)) {
     free(todir);
-    return -errno;
+    int err=errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   free(todir);
@@ -360,7 +418,9 @@ static int memfs_rename(const char *from, const char *to) {
   // TODO: When replacing, perform the same things as when unlinking
   if(!dir_add_alloc(todirnode, tonam, node, 1)) {
     free(tonam);
-    return -errno;
+    int err=errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   free(tonam);
@@ -369,27 +429,35 @@ static int memfs_rename(const char *from, const char *to) {
 
   if(!dir_remove(fromdirnode, fromnam)) {
     free(fromnam);
-    return -errno;
+    int err=errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   free(fromnam);
 
+  rwmutex_write_unlock(&the_fs.lock);
   return 0;
 }
 
 static int memfs_link(const char *from, const char *to) {
+  rwmutex_write_lock(&the_fs.lock);
   char *todir, *tonam;
   struct node *node, *todirnode;
 
   if(!getnodebypath(from, &the_fs, &node)) {
-    return -errno;
+    int err= errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   todir = safe_dirname(to);
 
   if(!getnodebypath(todir, &the_fs, &todirnode)) {
     free(todir);
-    return -errno;
+    int err= errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   free(todir);
@@ -398,18 +466,23 @@ static int memfs_link(const char *from, const char *to) {
 
   if(!dir_add_alloc(todirnode, tonam, node, 0)) {
     free(tonam);
-    return -errno;
+    int err= errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
-
+  rwmutex_write_unlock(&the_fs.lock);
   free(tonam);
 
   return 0;
 }
 
 static int memfs_chmod(const char *path, mode_t mode) {
+  rwmutex_write_lock(&the_fs.lock);
   struct node *node;
   if(!getnodebypath(path, &the_fs, &node)) {
-    return -errno;
+    int err=errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   mode_t mask = S_ISUID | S_ISGID | S_ISVTX |
@@ -421,13 +494,17 @@ static int memfs_chmod(const char *path, mode_t mode) {
 
   update_times(node, U_CTIME);
 
+  rwmutex_write_unlock(&the_fs.lock);
   return 0;
 }
 
 static int memfs_chown(const char *path, uid_t uid, gid_t gid) {
+  rwmutex_write_unlock(&the_fs.lock);
   struct node *node;
   if(!getnodebypath(path, &the_fs, &node)) {
-    return -errno;
+    int err=errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   node->vstat.st_uid = uid;
@@ -435,25 +512,33 @@ static int memfs_chown(const char *path, uid_t uid, gid_t gid) {
 
   update_times(node, U_CTIME);
 
+  rwmutex_write_unlock(&the_fs.lock);
   return 0;
 }
 
 static int memfs_utimens(const char *path, const struct timespec ts[2]) {
+  rwmutex_write_lock(&the_fs.lock);
   struct node *node;
   if(!getnodebypath(path, &the_fs, &node)) {
-    return -errno;
+    int err= errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   node->vstat.st_atime = ts[0].tv_sec;
   node->vstat.st_mtime = ts[1].tv_sec;
 
+  rwmutex_write_unlock(&the_fs.lock);
   return 0;
 }
 
 static int memfs_truncate(const char *path, off_t size) {
+  rwmutex_write_lock(&the_fs.lock);
   struct node *node;
   if(!getnodebypath(path, &the_fs, &node)) {
-    return -errno;
+    int err=errno;
+    rwmutex_write_unlock(&the_fs.lock);
+    return -err;
   }
 
   // Calculate new block count
@@ -464,6 +549,7 @@ static int memfs_truncate(const char *path, off_t size) {
     // Allocate additional memory
     void *newdata = malloc(newblkcnt * BLOCKSIZE);
     if(!newdata) {
+      rwmutex_write_unlock(&the_fs.lock);
       return -ENOMEM;
     }
 
@@ -474,6 +560,7 @@ static int memfs_truncate(const char *path, off_t size) {
     // Allocate new memory so we can free the unnecessarily large memory
     void *newdata = malloc(newblkcnt * BLOCKSIZE);
     if(!newdata) {
+      rwmutex_write_unlock(&the_fs.lock);
       return -ENOMEM;
     }
 
@@ -491,10 +578,11 @@ static int memfs_truncate(const char *path, off_t size) {
   node->vstat.st_size = size;
   node->vstat.st_blocks = newblkcnt;
 
+  rwmutex_write_unlock(&the_fs.lock);
   return 0;
 }
 
-static int memfs_open(const char *path, struct fuse_file_info *fi) {
+static int memfs_open_locked(const char *path, struct fuse_file_info *fi) {
   struct node *node;
   fprintf(stderr, "[open] path: %s\n", path);
   if(!getnodebypath(path, &the_fs, &node)) {
@@ -522,33 +610,44 @@ static int memfs_open(const char *path, struct fuse_file_info *fi) {
 
   return 0;
 }
+static int memfs_open(const char *path, struct fuse_file_info *fi){
+  rwmutex_write_lock(&the_fs.lock);
+  int ret= memfs_open_locked(path,fi);
+  rwmutex_write_unlock(&the_fs.lock);
+  return ret;
+}
 
 static int memfs_create(const char *path, mode_t mode,
                         struct fuse_file_info *fi) {
+                          rwmutex_write_lock(&the_fs.lock);
     int ret;
     fprintf(stderr, "[create] path: %s\n", path);
     
     /* Create a regular file */
-    ret = memfs_mknod(path, S_IFREG | mode, 0);
-    if (ret != 0)
-        return ret;
-
-    /* Open the newly created file */
-    ret = memfs_open(path, fi);
-    if (ret != 0) {
-        /* Roll back creation if opening fails */
-        memfs_unlink(path);
+    ret = memfs_mknod_locked(path, S_IFREG | mode, 0);
+    if (ret != 0){
+        rwmutex_write_unlock(&the_fs.lock);
         return ret;
     }
-
+    /* Open the newly created file */
+    ret = memfs_open_locked(path, fi);
+    if (ret != 0) {
+        /* Roll back creation if opening fails */
+        memfs_unlink_locked(path);
+        rwmutex_write_unlock(&the_fs.lock);
+        return ret;
+    }
+    rwmutex_write_unlock(&the_fs.lock);
     return 0;
 }
 
 static int memfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+  rwmutex_write_lock(&the_fs.lock);
   struct filehandle *fh = (struct filehandle *) fi->fh;
 
   // Check whether the file was opened for reading
   if(!O_READ(fh->o_flags)) {
+    rwmutex_write_unlock(&the_fs.lock);
     return -EACCES;
   }
 
@@ -558,6 +657,7 @@ static int memfs_read(const char *path, char *buf, size_t size, off_t offset, st
 
   // Check whether offset is at or beyond the end of file
   if(offset >= filesize) {
+    rwmutex_write_unlock(&the_fs.lock);
     return 0;
   }
 
@@ -570,14 +670,17 @@ static int memfs_read(const char *path, char *buf, size_t size, off_t offset, st
 
   update_times(node, U_ATIME);
 
+  rwmutex_write_unlock(&the_fs.lock);
   return n;
 }
 
 static int memfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+  rwmutex_write_lock(&the_fs.lock);
   struct filehandle *fh = (struct filehandle *) fi->fh;
 
   // Check whether the file was opened for writing
   if(!O_WRITE(fh->o_flags)) {
+    rwmutex_write_unlock(&the_fs.lock);
     return -EACCES;
   }
 
@@ -590,6 +693,7 @@ static int memfs_write(const char *path, const char *buf, size_t size, off_t off
     // Allocate more memory
     void *newdata = malloc(req_blocks * BLOCKSIZE);
     if(!newdata) {
+      rwmutex_write_unlock(&the_fs.lock);
       return -ENOMEM;
     }
 
@@ -615,10 +719,12 @@ static int memfs_write(const char *path, const char *buf, size_t size, off_t off
 
   update_times(node, U_CTIME | U_MTIME);
 
+  rwmutex_write_unlock(&the_fs.lock);
   return size;
 }
 
 static int memfs_release(const char *path, struct fuse_file_info *fi) {
+  rwmutex_write_lock(&the_fs.lock);
   struct filehandle *fh = (struct filehandle *) fi->fh;
 
   // If the file was deleted but we could not free it due to open file descriptors,
@@ -633,6 +739,7 @@ static int memfs_release(const char *path, struct fuse_file_info *fi) {
   // Free "file handle"
   free(fh);
 
+  rwmutex_write_unlock(&the_fs.lock);
   return 0;
 }
 
@@ -660,9 +767,21 @@ static struct fuse_operations memfs_oper = {
 
 //
 // Application entry point
-//
+//F
 
-int main(int argc, char *argv[]) {
+static void *statistics_thread(void *arg) {
+  (void)arg;
+
+  while(1){
+    sleep(5);
+
+    rwmutex_read_lock(&the_fs.lock);
+    collect_statistics(the_fs.root);
+    rwmutex_read_unlock(&the_fs.lock);
+  }
+  return NULL;
+}
+int main(int argc,char *argv[]){
   // Initialize root directory
   struct node *root = malloc(sizeof(struct node));
 
@@ -676,6 +795,12 @@ int main(int argc, char *argv[]) {
 
   // Set root directory of filesystem
   the_fs.root = root;
+
+  rwmutex_init(&the_fs.lock);
+
+  pthread_t stats_tid;
+  pthread_create(&stats_tid,NULL,statistics_thread,NULL);
+  pthread_detach(stats_tid);
 
   umask(0);
   return fuse_main(argc, argv, &memfs_oper, NULL);

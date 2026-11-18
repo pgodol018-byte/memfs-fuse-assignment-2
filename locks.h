@@ -5,11 +5,17 @@
 #define _LOCKS_H
 
 struct mutex {
-        
+   pthread_mutex_t lock;     
 };
 
 struct rwmutex {
+    pthread_mutex_t mutex;
+    pthread_cond_t readers_cv;
+    pthread_cond_t writers_cv;
 
+    int active_readers;
+    int active_writers;
+    int waiting_writers;
 };
 
 // Simple lock interface.
