@@ -1,7 +1,7 @@
 
 CC=gcc
-CFLAGS=-g -Wall -D_FILE_OFFSET_BITS=64
-LDFLAGS=-lfuse
+CFLAGS=-g -Wall -D_FILE_OFFSET_BITS=64 -fsanitize=thread
+LDFLAGS=-lfuse -fsanitize=thread
 
 OBJ=memfs.o node.o dir.o statistics.o locks.o
 

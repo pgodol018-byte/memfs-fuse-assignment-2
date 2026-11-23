@@ -19,8 +19,8 @@
 
 #define BLOCKSIZE 4096
 
-#define O_WRITE(flags) ((flags) & (O_RDWR | O_WRONLY))
-#define O_READ(flags)  (((flags) & (O_RDWR | O_RDONLY)) | !O_WRITE(flags))
+#define O_WRITE(flags) (((flags) &O_ACCMODE) == O_WRONLY || ((flags) & O_ACCMODE) == O_RDWR)
+#define O_READ(flags)  (((flags) &O_ACCMODE) == O_RDONLY || ((flags) & O_ACCMODE) == O_RDWR)
 
 #define U_ATIME (1 << 0)
 #define U_CTIME (1 << 1)
@@ -78,6 +78,12 @@ static int initstat(struct node *node, mode_t mode) {
   update_times(node, U_ATIME | U_MTIME | U_CTIME);
   return 1;
 }
+static void destroy_node(struct node *node){
+  if (!node) return;
+  if (node->data) free(node->data);
+  rwmutex_destroy(&node->lock);
+  free(node);
+}
 
 static int createentry(const char *path, mode_t mode, struct node **node) {
   char *dirpath = safe_dirname(path);
@@ -98,9 +104,13 @@ static int createentry(const char *path, mode_t mode, struct node **node) {
 
   (*node)->fd_count = 0;
   (*node)->delete_on_close = 0;
+  (*node)->data=NULL;
+  rwmutex_init(&(*node)->lock);
+
 
   // Initialize stats
   if(!initstat(*node, mode)) {
+    rwmutex_destroy(&(*node)->lock);
     free(*node);
     return -errno;
   }
@@ -110,10 +120,15 @@ static int createentry(const char *path, mode_t mode, struct node **node) {
   (*node)->vstat.st_gid = ctx->gid;
 
   // Add to parent directory
-  if(!dir_add_alloc(dir, safe_basename(path), *node, 0)) {
+  char *name=safe_basename(path);
+  if(!dir_add_alloc(dir, name , *node, 0)) {
+    free(name);
+    rwmutex_destroy(&(*node)->lock);
     free(*node);
+    
     return -errno;
   }
+  free(name);
 
   return 0;
 }
@@ -131,6 +146,7 @@ static int memfs_getattr(const char *path, struct stat *stbuf) {
     rwmutex_read_unlock(&the_fs.lock);
     return -errno;
   }
+  rwmutex_read_lock(&node->lock);
 
   stbuf->st_mode   = node->vstat.st_mode;
   stbuf->st_nlink  = node->vstat.st_nlink;
@@ -146,6 +162,7 @@ static int memfs_getattr(const char *path, struct stat *stbuf) {
   if(S_ISDIR(node->vstat.st_mode)) {
     stbuf->st_nlink++;
   }
+  rwmutex_read_unlock(&node->lock);
   rwmutex_read_unlock(&the_fs.lock);
   return 0;
 }
@@ -159,8 +176,9 @@ static int memfs_readlink(const char *path, char *buf, size_t size) {
     rwmutex_read_unlock(&the_fs.lock);
     return -err;
   }
-
+  rwmutex_read_lock(&node->lock);
   if(!S_ISLNK(node->vstat.st_mode)) {
+    rwmutex_read_unlock(&node->lock);
     rwmutex_read_unlock(&the_fs.lock);
     return -ENOLINK;
   }
@@ -170,11 +188,12 @@ static int memfs_readlink(const char *path, char *buf, size_t size) {
   // unless the buffer is not large enough to hold the path. In that case, fuse will null-terminate
   // the string before passing it on.
 
-  if(node->vstat.st_size > size) {
+  if(node->vstat.st_size >= size) {
     memcpy(buf, node->data, size);
   } else {
     strcpy(buf, node->data);
   }
+  rwmutex_read_unlock(&node->lock);
   rwmutex_read_unlock(&the_fs.lock);
 
   return 0;
@@ -194,21 +213,29 @@ static int memfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, of
     rwmutex_read_unlock(&the_fs.lock);
     return -ENOTDIR;
   }
-
+  rwmutex_read_lock(&dir->lock);
   filler(buf, ".",  &dir->vstat, 0);
+  rwmutex_read_unlock(&dir->lock);
   if(dir == the_fs.root) {
     filler(buf, "..", NULL, 0);
   } else {
     char *parent_path = safe_dirname(path);
     struct node *parent;
-    getnodebypath(parent_path, &the_fs, &parent);
+    if (getnodebypath(parent_path, &the_fs, &parent)){
+      rwmutex_read_lock(&parent->lock);
+      filler(buf, "..", &parent->vstat, 0);
+      rwmutex_read_unlock(&parent->lock);
+    }
     free(parent_path);
-    filler(buf, "..", &parent->vstat, 0);
+    
   }
 
   struct direntry *entry = dir->data;
   while(entry != NULL) {
-    if(filler(buf, entry->name, &entry->node->vstat, 0))
+    rwmutex_read_lock(&entry->node->lock);
+    int full=filler(buf,entry->name , &entry->node->vstat, 0);
+    rwmutex_read_unlock(&entry->node->lock);
+    if(full)
       break;
     entry = entry->next;
   }
@@ -288,17 +315,24 @@ static int memfs_unlink_locked(const char *path) {
   }
 
   free(name);
-
+  int should_free=0;
+  rwmutex_write_lock(&node->lock);
   // If the link count is zero, delete the associated data
   if(node->vstat.st_nlink == 0) {
     if(node->fd_count == 0) {
+      should_free=1;
+    }
       // No open file descriptors, we can safely delete the node
-      if(node->data) free(node->data);
-      free(node);
-    } else {
+     
+     else {
       // There are open file descriptors, schedule deletion
       node->delete_on_close = 1;
     }
+    rwmutex_write_unlock(&node->lock);
+    if (should_free){
+      destroy_node(node);
+    }
+
   }
 
   return 0;
@@ -357,7 +391,8 @@ static int memfs_rmdir(const char *path) {
 
   free(name);
 
-  free(node);
+  node->data =NULL;
+  destroy_node(node);
 
   rwmutex_write_unlock(&the_fs.lock);
   return 0;
@@ -435,6 +470,9 @@ static int memfs_rename(const char *from, const char *to) {
   }
 
   free(fromnam);
+  rwmutex_write_lock(&node->lock);
+  update_times(node,U_CTIME);
+  rwmutex_write_unlock(&node->lock);
 
   rwmutex_write_unlock(&the_fs.lock);
   return 0;
@@ -470,20 +508,25 @@ static int memfs_link(const char *from, const char *to) {
     rwmutex_write_unlock(&the_fs.lock);
     return -err;
   }
-  rwmutex_write_unlock(&the_fs.lock);
   free(tonam);
+   rwmutex_write_lock(&node->lock);
+  update_times(node,U_CTIME);
+  rwmutex_write_unlock(&node->lock);
+  rwmutex_write_unlock(&the_fs.lock);
+  
 
   return 0;
 }
 
 static int memfs_chmod(const char *path, mode_t mode) {
-  rwmutex_write_lock(&the_fs.lock);
+  rwmutex_read_lock(&the_fs.lock);
   struct node *node;
   if(!getnodebypath(path, &the_fs, &node)) {
     int err=errno;
     rwmutex_write_unlock(&the_fs.lock);
     return -err;
   }
+  rwmutex_write_lock(&node->lock);
 
   mode_t mask = S_ISUID | S_ISGID | S_ISVTX |
                 S_IRUSR | S_IWUSR | S_IXUSR |
@@ -494,93 +537,112 @@ static int memfs_chmod(const char *path, mode_t mode) {
 
   update_times(node, U_CTIME);
 
-  rwmutex_write_unlock(&the_fs.lock);
+  rwmutex_write_unlock(&node->lock);
+  rwmutex_read_unlock(&the_fs.lock);
   return 0;
 }
 
 static int memfs_chown(const char *path, uid_t uid, gid_t gid) {
-  rwmutex_write_unlock(&the_fs.lock);
+  rwmutex_read_lock(&the_fs.lock);
   struct node *node;
   if(!getnodebypath(path, &the_fs, &node)) {
     int err=errno;
-    rwmutex_write_unlock(&the_fs.lock);
+    rwmutex_read_unlock(&the_fs.lock);
     return -err;
   }
+  rwmutex_write_lock(&node->lock);
 
   node->vstat.st_uid = uid;
   node->vstat.st_gid = gid;
 
   update_times(node, U_CTIME);
 
-  rwmutex_write_unlock(&the_fs.lock);
+  rwmutex_write_unlock(&node->lock);
+
+  rwmutex_read_unlock(&the_fs.lock);
   return 0;
 }
 
 static int memfs_utimens(const char *path, const struct timespec ts[2]) {
-  rwmutex_write_lock(&the_fs.lock);
+  rwmutex_read_lock(&the_fs.lock);
   struct node *node;
   if(!getnodebypath(path, &the_fs, &node)) {
     int err= errno;
-    rwmutex_write_unlock(&the_fs.lock);
+    rwmutex_read_unlock(&the_fs.lock);
     return -err;
   }
+  rwmutex_write_lock(&node->lock);
 
   node->vstat.st_atime = ts[0].tv_sec;
   node->vstat.st_mtime = ts[1].tv_sec;
-
-  rwmutex_write_unlock(&the_fs.lock);
+  rwmutex_write_unlock(&node->lock);
+  rwmutex_read_unlock(&the_fs.lock);
   return 0;
 }
 
 static int memfs_truncate(const char *path, off_t size) {
-  rwmutex_write_lock(&the_fs.lock);
+  rwmutex_read_lock(&the_fs.lock);
   struct node *node;
   if(!getnodebypath(path, &the_fs, &node)) {
     int err=errno;
-    rwmutex_write_unlock(&the_fs.lock);
+    rwmutex_read_unlock(&the_fs.lock);
     return -err;
   }
+  rwmutex_write_lock(&node->lock);
+  node->fd_count++;
+  rwmutex_read_unlock(&the_fs.lock);
 
   // Calculate new block count
   blkcnt_t newblkcnt = (size + BLOCKSIZE - 1) / BLOCKSIZE;
   blkcnt_t oldblkcnt = node->vstat.st_blocks;
 
-  if(oldblkcnt < newblkcnt) {
-    // Allocate additional memory
-    void *newdata = malloc(newblkcnt * BLOCKSIZE);
-    if(!newdata) {
-      rwmutex_write_unlock(&the_fs.lock);
-      return -ENOMEM;
+  if(oldblkcnt != newblkcnt) {
+    if (newblkcnt == 0) {
+      free(node->data);
+      node->data = NULL;
+    } else {
+      void *newdata = calloc(newblkcnt, BLOCKSIZE); 
+      if(!newdata) {
+        goto out_err;
+      }
+      if (node->data != NULL && node->vstat.st_size > 0) {
+        size_t copy_bytes = (node->vstat.st_size < size) ? node->vstat.st_size : size;
+        memcpy(newdata, node->data, copy_bytes);
+      }
+      free(node->data);
+      node->data = newdata;
     }
-
-    memcpy(newdata, node->data, node->vstat.st_size);
-    free(node->data);
-    node->data = newdata;
-  } else if(oldblkcnt > newblkcnt) {
-    // Allocate new memory so we can free the unnecessarily large memory
-    void *newdata = malloc(newblkcnt * BLOCKSIZE);
-    if(!newdata) {
-      rwmutex_write_unlock(&the_fs.lock);
-      return -ENOMEM;
-    }
-
-    memcpy(newdata, node->data, size);
-    free(node->data);
-    node->data = newdata;
+  } else if (node->data != NULL && node->vstat.st_size < size) {
+    memset((char *) node->data + node->vstat.st_size, 0, size - node->vstat.st_size);
   }
 
-  // Fill additional memory with zeroes
-  if(node->vstat.st_size < size) {
-          memset((char *) node->data + node->vstat.st_size, 0, size - node->vstat.st_size);
-  }
-
-  // Update file size
   node->vstat.st_size = size;
   node->vstat.st_blocks = newblkcnt;
+  update_times(node, U_CTIME | U_MTIME);
 
-  rwmutex_write_unlock(&the_fs.lock);
+  int should_free = 0;
+  if(--node->fd_count == 0 && node->delete_on_close) {
+    should_free = 1;
+  }
+  rwmutex_write_unlock(&node->lock);
+
+  if (should_free) {
+    destroy_node(node);
+  }
   return 0;
+
+out_err:
+  {
+    int should_free_err = 0;
+    if(--node->fd_count == 0 && node->delete_on_close) {
+      should_free_err = 1;
+    }
+    rwmutex_write_unlock(&node->lock);
+    if (should_free_err) destroy_node(node);
+    return -ENOMEM;
+  }
 }
+
 
 static int memfs_open_locked(const char *path, struct fuse_file_info *fi) {
   struct node *node;
@@ -588,9 +650,11 @@ static int memfs_open_locked(const char *path, struct fuse_file_info *fi) {
   if(!getnodebypath(path, &the_fs, &node)) {
     return -errno;
   }
+  rwmutex_write_lock(&node->lock);
 
   if(!S_ISREG(node->vstat.st_mode)) {
     if(S_ISDIR(node->vstat.st_mode)) {
+      rwmutex_write_unlock(&node->lock);
       return -EISDIR;
     }
   }
@@ -607,13 +671,14 @@ static int memfs_open_locked(const char *path, struct fuse_file_info *fi) {
   fi->fh = (uint64_t) fh;
 
   node->fd_count++;
+  rwmutex_write_unlock(&node->lock);
 
   return 0;
 }
 static int memfs_open(const char *path, struct fuse_file_info *fi){
-  rwmutex_write_lock(&the_fs.lock);
+  rwmutex_read_lock(&the_fs.lock);
   int ret= memfs_open_locked(path,fi);
-  rwmutex_write_unlock(&the_fs.lock);
+  rwmutex_read_unlock(&the_fs.lock);
   return ret;
 }
 
@@ -642,22 +707,23 @@ static int memfs_create(const char *path, mode_t mode,
 }
 
 static int memfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
-  rwmutex_write_lock(&the_fs.lock);
+  
   struct filehandle *fh = (struct filehandle *) fi->fh;
 
   // Check whether the file was opened for reading
   if(!O_READ(fh->o_flags)) {
-    rwmutex_write_unlock(&the_fs.lock);
+    
     return -EACCES;
   }
 
   struct node *node = fh->node;
+  rwmutex_read_lock(&node->lock);
 
   off_t filesize = node->vstat.st_size;
 
   // Check whether offset is at or beyond the end of file
   if(offset >= filesize) {
-    rwmutex_write_unlock(&the_fs.lock);
+    rwmutex_read_unlock(&node->lock);
     return 0;
   }
 
@@ -670,21 +736,22 @@ static int memfs_read(const char *path, char *buf, size_t size, off_t offset, st
 
   update_times(node, U_ATIME);
 
-  rwmutex_write_unlock(&the_fs.lock);
+  rwmutex_read_unlock(&node->lock);
   return n;
 }
 
 static int memfs_write(const char *path, const char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
-  rwmutex_write_lock(&the_fs.lock);
+ 
   struct filehandle *fh = (struct filehandle *) fi->fh;
 
   // Check whether the file was opened for writing
   if(!O_WRITE(fh->o_flags)) {
-    rwmutex_write_unlock(&the_fs.lock);
+    
     return -EACCES;
   }
 
   struct node *node = fh->node;
+  rwmutex_write_lock(&node->lock);
 
   // Calculate number of required blocks
   blkcnt_t req_blocks = (offset + size + BLOCKSIZE - 1) / BLOCKSIZE;
@@ -693,7 +760,7 @@ static int memfs_write(const char *path, const char *buf, size_t size, off_t off
     // Allocate more memory
     void *newdata = malloc(req_blocks * BLOCKSIZE);
     if(!newdata) {
-      rwmutex_write_unlock(&the_fs.lock);
+      rwmutex_write_unlock(&node->lock);
       return -ENOMEM;
     }
 
@@ -719,27 +786,33 @@ static int memfs_write(const char *path, const char *buf, size_t size, off_t off
 
   update_times(node, U_CTIME | U_MTIME);
 
-  rwmutex_write_unlock(&the_fs.lock);
+  rwmutex_write_unlock(&node->lock);
   return size;
 }
 
 static int memfs_release(const char *path, struct fuse_file_info *fi) {
-  rwmutex_write_lock(&the_fs.lock);
+  
   struct filehandle *fh = (struct filehandle *) fi->fh;
+  struct node *node = fh->node;
 
   // If the file was deleted but we could not free it due to open file descriptors,
   // free the node and its data after all file descriptors have been closed.
-  if(--fh->node->fd_count == 0) {
-    if(fh->node->delete_on_close) {
-      if(fh->node->data) free(fh->node->data);
-      free(fh->node);
+ 
+  int should_free = 0;
+
+  rwmutex_write_lock(&node->lock); 
+  if(--node->fd_count == 0) {
+    if(node->delete_on_close) {
+      should_free = 1;
     }
   }
+  rwmutex_write_unlock(&node->lock); 
 
-  // Free "file handle"
+  if (should_free) {
+    destroy_node(node); 
+  }
+
   free(fh);
-
-  rwmutex_write_unlock(&the_fs.lock);
   return 0;
 }
 
@@ -792,6 +865,7 @@ int main(int argc,char *argv[]){
 
   // No entries
   root->data = NULL;
+  rwmutex_init(&root->lock);
 
   // Set root directory of filesystem
   the_fs.root = root;
